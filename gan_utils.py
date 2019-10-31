@@ -1,84 +1,89 @@
-import dataiku as dk 
-import datetime as dt
-import requests as rq
-import pandas as pd
+from tqdm import tqdm
 import numpy as np
+import pandas as pd
+import os
 import json
-from multiprocessing import  Pool
 
-from bs4 import BeautifulSoup as Soup
+from keras.layers import Input, LSTM, Reshape
+from keras.models import Model, Sequential
+from keras.layers.core import Dense, Dropout
+from keras.layers.advanced_activations import LeakyReLU
+from keras.optimizers import Adam
+from keras import initializers
 
-def merge_two_dicts(x, y):
-    """Given two dicts, merge them into a new dict as a shallow copy."""
-    z = x.copy()
-    z.update(y)
-    return(z)
 
-def get_schema(lst):
-    """ Build a standard dataiku.Dataset schema. """
-    
-    def prepare_schema(el):
-        if type(el)!= tuple:
-            return(el,"string")
-        else:
-            return(el)
-        
-    lstSch = [prepare_schema(el) for el in lst]
-    return([{"name":l[0],"type":l[1]} for l in lstSch])
+def get_optimizer():
+    return(Adam(lr=0.0002, beta_1=0.5))
 
-def assess_type(test):
-    if not test or test!=test :
-        return('NULL')
-    try :
-        int(test)
-        return('INT')
-    except ValueError:
-        pass
-    try:
-        float(test)
-        return('FLOAT')
-    except ValueError:
-        pass
-    
-    return('TEXT')
+def get_rgenerator(optimizer, lstm_cell, random_dim, dim_out):
+    inp = Input(shape=(random_dim,1))
+    x = LSTM(lstm_cell)(inp)
+    relu = LeakyReLU(0.2)(x)
+    gen = Dense(dim_out,activation='tanh')(relu)
 
-def get_soup(link,headerName=None,params=None,verify=None):
-    """ The deaders have to be defined as a custom variables at the project level. """
-    if headerName: 
-        headers = json.loads(dk.get_custom_variables()[headerName])
-    else:
-        headers = None 
-        
-    if not verify :
-        r = rq.get(link,headers=headers,params=params)
-    else:
-        r = rq.get(link,headers=headers,params=params,verify=verify)
-    soup = Soup(r.text,'html.parser')
-    return(soup)
+    # Don't forget to reshape
+    gen = Reshape((dim_out,1))(gen)
+    rgen = Model(inputs=inp,outputs=gen)
+    rgen.compile(loss='binary_crossentropy',optimizer=optimizer)
+    return(rgen)
 
-def pooling(fct,lst,nb_pool=8):
-    
-    """Open different pools for the same function. Return the output of each pool in a list"""
-    p = Pool(nb_pool)
-    infos = p.map(fct,lst)
-    p.terminate()
-    p.join()
-    return infos
+def get_rdiscriminator(optimizer, lstm_cell, dim_out):
+    inp = Input(shape=(dim_out,1))
 
-def date_index_df(df,colDate):
-    # Should be added to general.utils function
-    df[colDate] = pd.to_datetime(df[colDate].values)
-    df.index = df[colDate]
-    return df
+    x = LSTM(lstm_cell)(inp)
+    relu = LeakyReLU(0.2)(x)
+    drop = Dropout(0.3)(relu)
 
-def get_showered(dirtyPig):
-    """Clean a dirty string"""
-    return str(dirtyPig.encode('utf-8')).translate(None,"\r\n\t").strip(' ').decode('utf-8')
+    disc = Dense(1,activation="sigmoid")(drop)
 
-def string_to_list_dict(dirtyPig):
-    """Transform a string representing a list of dict into an actual list of dicts"""
-    # Remove '[{'   '}]' at the beginning and the end of the string
-    dirtyPig = dirtyPig[2:-2]
-    # Splitting on '},{' - making a str_dict by addinge '{' and '}' - loading as a dict
-    cleanLst = [json.loads("{"+el+"}") for el in dirtyPig.split('},{')]
-    return cleanLst
+    rdisc = Model(inputs=inp,outputs=disc)
+    rdisc.compile(loss='binary_crossentropy',optimizer=optimizer)
+    return(rdisc)
+
+# Get GAN
+def get_gan_network(discriminator, generator, optimizer, random_dim):
+    # We initially set trainable to False since we only want to train either the
+    # generator or discriminator at a time
+
+    discriminator.trainable = False
+    gan_input = Input(shape=(random_dim,))
+    x = generator(gan_input)
+    gan_output = discriminator(x)
+    gan = Model(inputs=gan_input, outputs=gan_output)
+    gan.compile(loss='binary_crossentropy', optimizer=optimizer)
+    return(gan)
+
+def get_rgan_network(discriminator, generator, optimizer, random_dim):
+    # We want to train either the discriminator or the generator so we start by puting the discriminator as
+    # not trainable.
+
+    discriminator.trainable = False
+    # gan input will be the forger inspiration: 100 dim random noised vector
+    gan_input = Input(shape=(random_dim,1))
+    # The output of the generator is an image => 784 dim vector
+    img = generator(gan_input)
+
+    # Pass that image to the discriminator : is it a real image or not
+    gan_output = discriminator(img)
+    # Create model
+    gan = Model(inputs = gan_input, outputs = gan_output)
+    gan.compile(loss = "binary_crossentropy", optimizer = optimizer)
+    return(gan)
+
+def prepare_gan(optimizer, lstm_cell, random_dim, dim_out):
+    generator = get_rgenerator(optimizer, lstm_cell, random_dim, dim_out)
+    discriminator = get_rdiscriminator(optimizer, lstm_cell, dim_out)
+    gan = get_rgan_network(discriminator, generator, optimizer, random_dim)
+    return(generator, discriminator, gan)
+
+# Save models
+def save_generator(ticker, generator, path):
+    partition_path = os.path.join(path, ticker)
+    if not os.path.exists(partition_path):
+        os.makedirs(partition_path)
+    generator.save_weights(partition_path + "/generator.h5")
+    #generator.save(partition_path + "/generator.h5")
+    model_json = generator.to_json()
+    with open(partition_path + "/generator.json", 'w') as f:
+        json.dump(model_json, f)
+    print("Model {0} saved on disk".format(ticker))
